@@ -1,366 +1,666 @@
-import random
-import datetime as dt
+import io
+import math
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 import streamlit as st
+from difflib import get_close_matches
 
-st.set_page_config(page_title="Seat Planner", layout="wide")
-st.title("Seat Planner")
-st.caption("4 per table • Day-based rosters • Grade balancing • Table-view export")
 
-# ----------------------------
-# Registry (your real schools/classes)
-# ----------------------------
-SCHOOL_CLASS_REGISTRY = {
+# -------------------------
+# Canonical Schools / Classes
+# -------------------------
+CANONICAL = {
     "Keikyu School": ["Emerald", "Maroon"],
     "Yako School": ["Yako Class"],
     "Tsukagoshi School": ["Tsukagoshi Class"],
     "Saiwai School": ["Saiwai Class"],
 }
 
-SEATS = ["A", "B", "C", "D"]
-DAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+DEFAULT_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 
 
-# ----------------------------
+# -------------------------
+# Styling
+# -------------------------
+APP_CSS = """
+<style>
+:root{
+  --card-bg: rgba(255,255,255,0.06);
+  --card-border: rgba(255,255,255,0.10);
+  --muted: rgba(255,255,255,0.65);
+  --accent: #7dd3fc;
+  --good: #86efac;
+  --warn: #fde68a;
+  --bad: #fca5a5;
+}
+
+.block-container{ padding-top: 1.6rem; padding-bottom: 2rem; }
+h1, h2, h3{ letter-spacing: .2px; }
+.small-muted{ color: var(--muted); font-size: 0.95rem; }
+
+.kpi-row{
+  display:flex; gap: 10px; flex-wrap: wrap; margin: 6px 0 14px 0;
+}
+.kpi{
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  padding: 10px 12px;
+  border-radius: 12px;
+  min-width: 160px;
+}
+.kpi .label{ color: var(--muted); font-size: 0.85rem; }
+.kpi .value{ font-size: 1.2rem; margin-top: 2px; }
+
+.table-grid{
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+.table-card{
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+  background: var(--card-bg);
+  overflow:hidden;
+}
+.table-card .hdr{
+  padding: 10px 12px;
+  display:flex;
+  align-items:center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--card-border);
+}
+.table-pill{
+  font-size: 0.85rem;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--card-border);
+  background: rgba(255,255,255,0.04);
+  color: rgba(255,255,255,0.85);
+}
+.seats{
+  padding: 10px 12px 12px 12px;
+  display:grid;
+  gap: 8px;
+}
+.seat{
+  border: 1px solid var(--card-border);
+  background: rgba(255,255,255,0.04);
+  border-radius: 12px;
+  padding: 8px 10px;
+  display:flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.seat .badge{
+  font-size: 0.72rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.85);
+  white-space: nowrap;
+}
+.seat .name{
+  font-weight: 600;
+  line-height: 1.2;
+}
+.seat .meta{
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin-top: 2px;
+  line-height: 1.2;
+}
+.seat.leader{
+  border-color: rgba(253,230,138,0.55);
+  background: rgba(253,230,138,0.10);
+}
+.seat.absent{
+  opacity: 0.55;
+  filter: grayscale(25%);
+  text-decoration: line-through;
+}
+.hr-soft{
+  border:0; height:1px;
+  background: rgba(255,255,255,0.10);
+  margin: 14px 0;
+}
+</style>
+"""
+
+
+# -------------------------
 # Helpers
-# ----------------------------
-def monday_of_week(d: dt.date) -> dt.date:
-    return d - dt.timedelta(days=d.weekday())
+# -------------------------
+def norm_text(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-def stable_seed(*parts) -> int:
-    """Deterministic seed across runs (simple stable hash)."""
-    s = "||".join(str(p) for p in parts)
-    h = 0
-    for ch in s:
-        h = (h * 31 + ord(ch)) % 2_000_000_000
-    return h
+def norm_key(s: str) -> str:
+    s = norm_text(s).lower()
+    s = re.sub(r"[^a-z0-9\s]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def seat_rotation_offset(day: str) -> int:
-    if day in DAY_ORDER:
-        return DAY_ORDER.index(day) % 4
-    return 0
+def closest_match(query: str, choices: List[str], cutoff: float = 0.72) -> Optional[str]:
+    if not query or not choices:
+        return None
+    matches = get_close_matches(query, choices, n=1, cutoff=cutoff)
+    return matches[0] if matches else None
 
 
-def rotate_seats_map(offset: int):
-    offset = offset % 4
-    return SEATS[offset:] + SEATS[:offset]
+def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # allow flexible input column names and map to required: School, Class, Name, Grade
+    colmap = {}
+    for c in df.columns:
+        ck = norm_key(c)
+        if ck in ["school", "schoolname", "campus"]:
+            colmap[c] = "School"
+        elif ck in ["class", "classname", "group", "room"]:
+            colmap[c] = "Class"
+        elif ck in ["name", "student", "studentname", "fullname"]:
+            colmap[c] = "Name"
+        elif ck in ["grade", "year", "level"]:
+            colmap[c] = "Grade"
+        elif ck in ["day", "weekday"]:
+            colmap[c] = "Day"
+        elif ck in ["leader", "teamleader", "tl", "role"]:
+            colmap[c] = "Role"
+        elif ck in ["attendance", "present", "status"]:
+            colmap[c] = "Status"
 
+    df = df.rename(columns=colmap)
 
-def load_file(uploaded):
-    if uploaded.name.lower().endswith(".xlsx"):
-        df = pd.read_excel(uploaded)
-    else:
-        df = pd.read_csv(uploaded)
-    df.columns = [str(c).strip().lower() for c in df.columns]
+    # normalize required columns
+    for req in ["School", "Class", "Name", "Grade"]:
+        if req not in df.columns:
+            df[req] = ""
+
+    # normalize optional columns
+    if "Day" not in df.columns:
+        df["Day"] = ""
+    if "Role" not in df.columns:
+        df["Role"] = ""
+    if "Status" not in df.columns:
+        df["Status"] = ""
+
+    # strip text
+    for c in ["School", "Class", "Name", "Grade", "Day", "Role", "Status"]:
+        df[c] = df[c].astype(str).map(norm_text)
+
     return df
 
 
-def require_cols(df, cols):
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns: {missing}")
+def load_file(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
+    if name.endswith(".csv"):
+        return pd.read_csv(io.BytesIO(raw))
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(io.BytesIO(raw))
+    raise ValueError("Unsupported file. Please upload CSV or Excel (.xlsx).")
 
 
-def clean_df(df):
-    df = df.copy()
-    for c in ["school", "class", "day", "name", "grade"]:
-        df[c] = df[c].astype(str).str.strip()
-    df = df[(df["name"] != "") & (df["name"].str.lower() != "nan")]
-    df = df[(df["grade"] != "") & (df["grade"].str.lower() != "nan")]
-    df = df[(df["day"] != "") & (df["day"].str.lower() != "nan")]
-    return df
+def build_school_class_options(df: pd.DataFrame) -> Tuple[List[str], Dict[str, List[str]]]:
+    # union canonical + discovered file values
+    discovered_schools = sorted({s for s in df["School"].dropna().astype(str).map(norm_text) if s and s.lower() != "nan"})
+    discovered_classes = sorted({c for c in df["Class"].dropna().astype(str).map(norm_text) if c and c.lower() != "nan"})
+
+    schools = sorted(set(list(CANONICAL.keys()) + discovered_schools))
+
+    classes_by_school: Dict[str, List[str]] = {}
+    for sch in schools:
+        base = CANONICAL.get(sch, [])
+        # add any classes seen in file for this school too
+        in_file = sorted({c for c in df.loc[df["School"] == sch, "Class"].astype(str).map(norm_text) if c and c.lower() != "nan"})
+        # if nothing for this school in file, still allow discovered global classes (teacher may be selecting before fixing file)
+        merged = sorted(set(base + in_file))
+        if not merged and discovered_classes:
+            merged = discovered_classes
+        classes_by_school[sch] = merged
+
+    return schools, classes_by_school
 
 
-def tables_needed(n_students: int) -> int:
-    return max(1, (n_students + 3) // 4)
+def detect_leader(row: pd.Series) -> bool:
+    role = norm_key(row.get("Role", ""))
+    name = norm_text(row.get("Name", ""))
+
+    if "leader" in role or role in ["tl", "team leader", "teamleader"]:
+        return True
+    # common teacher patterns
+    if re.search(r"\b(tl|leader)\b", norm_key(name)):
+        return True
+    if "★" in name or "☆" in name:
+        return True
+    return False
 
 
-def build_tables_with_constraints(
-    present_rows,
-    num_tables: int,
-    max_same_grade: int | None,
-    attempts: int = 400,
-    seed: int | None = None,
-):
-    """
-    present_rows: list of dicts: {"name":..., "grade":...}
-    Constraint: no table has > max_same_grade of the same grade (if max_same_grade not None).
-    """
-    rng = random.Random(seed)
-
-    for _ in range(attempts):
-        tables = [{"members": [], "grade_counts": {}} for _ in range(num_tables)]
-
-        pool = present_rows[:]
-        rng.shuffle(pool)
-
-        ok = True
-        for student in pool:
-            name = student["name"]
-            grade = student["grade"]
-
-            candidates = []
-            for t in tables:
-                if len(t["members"]) >= 4:
-                    continue
-                if max_same_grade is not None and t["grade_counts"].get(grade, 0) >= max_same_grade:
-                    continue
-                candidates.append(t)
-
-            if not candidates:
-                ok = False
-                break
-
-            candidates.sort(key=lambda t: (len(t["members"]), t["grade_counts"].get(grade, 0)))
-            chosen = candidates[0]
-
-            chosen["members"].append((name, grade))
-            chosen["grade_counts"][grade] = chosen["grade_counts"].get(grade, 0) + 1
-
-        if ok:
-            return tables
-
-    return None
+def detect_absent(row: pd.Series) -> bool:
+    status = norm_key(row.get("Status", ""))
+    name = norm_key(row.get("Name", ""))
+    if "absent" in status or status in ["a", "x", "no", "0"]:
+        return True
+    if "(absent)" in name or "[absent]" in name:
+        return True
+    return False
 
 
-def tables_to_plan(tables, day: str, rotate_seats: bool):
-    offset = seat_rotation_offset(day) if rotate_seats else 0
-    seat_order = rotate_seats_map(offset)
-
-    plan = {}
-    for idx, t in enumerate(tables, start=1):
-        plan[idx] = {s: ("", "") for s in SEATS}
-
-        members = t["members"][:]
-        # stable-ish order inside table for nicer output
-        members.sort(key=lambda x: (x[1], x[0]))  # grade then name
-
-        for i, seat in enumerate(seat_order):
-            if i < len(members):
-                plan[idx][seat] = members[i]
-
-    return plan
+@dataclass
+class Seat:
+    table_no: int
+    seat_no: int
+    name: str
+    grade: str
+    leader: bool
+    absent: bool
 
 
-def plan_to_tableview_df(plan, school, class_name, week_start, day):
+def grade_key(g: str) -> Tuple[int, str]:
+    # try to parse numeric grade, else keep as string
+    t = norm_key(g)
+    m = re.search(r"(\d+)", t)
+    if m:
+        return (int(m.group(1)), t)
+    return (999, t)
+
+
+def split_by_day(df: pd.DataFrame, days: List[str]) -> Dict[str, pd.DataFrame]:
+    # if file has explicit Day values, use them; otherwise treat all students as eligible every day
+    if df["Day"].astype(str).str.strip().replace("nan", "").eq("").all():
+        return {d: df.copy() for d in days}
+
+    # normalize day strings in file loosely (Mon/Monday etc.)
+    def normalize_day(x: str) -> str:
+        xk = norm_key(x)
+        if xk.startswith("mon"):
+            return "Mon"
+        if xk.startswith("tue"):
+            return "Tue"
+        if xk.startswith("wed"):
+            return "Wed"
+        if xk.startswith("thu"):
+            return "Thu"
+        if xk.startswith("fri"):
+            return "Fri"
+        if xk.startswith("sat"):
+            return "Sat"
+        if xk.startswith("sun"):
+            return "Sun"
+        return norm_text(x)
+
+    temp = df.copy()
+    temp["DayNorm"] = temp["Day"].astype(str).map(normalize_day)
+
+    out: Dict[str, pd.DataFrame] = {}
+    for d in days:
+        out[d] = temp.loc[temp["DayNorm"] == d].drop(columns=["DayNorm"]).copy()
+
+    return out
+
+
+def generate_plan_for_day(
+    df_day: pd.DataFrame,
+    seats_per_table: int = 4,
+    max_same_grade_per_table: int = 2,
+    rotate_offset: int = 0,
+) -> List[Seat]:
+    # remove empty names
+    roster = df_day.copy()
+    roster = roster[roster["Name"].astype(str).str.strip().ne("")]
+    if roster.empty:
+        return []
+
+    # stable rotation: rotate order, then seat
+    roster = roster.sort_values(["Grade", "Name"], key=lambda s: s.map(lambda v: grade_key(v)[0] if s.name == "Grade" else norm_text(v)))
+    roster_list = roster.to_dict(orient="records")
+
+    if roster_list:
+        rotate_offset = rotate_offset % len(roster_list)
+        roster_list = roster_list[rotate_offset:] + roster_list[:rotate_offset]
+
+    n_students = len(roster_list)
+    n_tables = max(1, math.ceil(n_students / seats_per_table))
+
+    # grade balancing with simple greedy constraint per table
+    tables: List[List[dict]] = [[] for _ in range(n_tables)]
+    grade_counts: List[Dict[str, int]] = [dict() for _ in range(n_tables)]
+
+    # sort by grade frequency first (more constrained first)
+    grades = [r.get("Grade", "") for r in roster_list]
+    freq: Dict[str, int] = {}
+    for g in grades:
+        freq[g] = freq.get(g, 0) + 1
+
+    roster_list.sort(key=lambda r: (-freq.get(r.get("Grade", ""), 0), grade_key(r.get("Grade", ""))[0], norm_text(r.get("Name", ""))))
+
+    for r in roster_list:
+        g = r.get("Grade", "")
+        placed = False
+
+        # try tables with fewer members first
+        table_order = sorted(range(n_tables), key=lambda i: (len(tables[i]), grade_counts[i].get(g, 0)))
+
+        for ti in table_order:
+            if len(tables[ti]) >= seats_per_table:
+                continue
+            if grade_counts[ti].get(g, 0) >= max_same_grade_per_table:
+                continue
+            tables[ti].append(r)
+            grade_counts[ti][g] = grade_counts[ti].get(g, 0) + 1
+            placed = True
+            break
+
+        # fallback: ignore grade limit if needed
+        if not placed:
+            for ti in table_order:
+                if len(tables[ti]) < seats_per_table:
+                    tables[ti].append(r)
+                    grade_counts[ti][g] = grade_counts[ti].get(g, 0) + 1
+                    break
+
+    # flatten into Seat list
+    out: List[Seat] = []
+    for t_idx, members in enumerate(tables, start=1):
+        for s_idx in range(seats_per_table):
+            if s_idx < len(members):
+                m = members[s_idx]
+                out.append(
+                    Seat(
+                        table_no=t_idx,
+                        seat_no=s_idx + 1,
+                        name=norm_text(m.get("Name", "")),
+                        grade=norm_text(m.get("Grade", "")),
+                        leader=detect_leader(pd.Series(m)),
+                        absent=detect_absent(pd.Series(m)),
+                    )
+                )
+            else:
+                out.append(
+                    Seat(
+                        table_no=t_idx,
+                        seat_no=s_idx + 1,
+                        name="(empty)",
+                        grade="",
+                        leader=False,
+                        absent=False,
+                    )
+                )
+    return out
+
+
+def seats_to_dataframe(seats: List[Seat], day: str) -> pd.DataFrame:
     rows = []
-    for t in sorted(plan.keys()):
-        row = {
-            "School": school,
-            "Class": class_name,
-            "WeekStart": week_start.isoformat(),
-            "Day": day,
-            "Table": t,
-        }
-        # Seat1..Seat4 (table-view export)
-        # Use A/B/C/D as display order
-        seat_vals = [plan[t]["A"], plan[t]["B"], plan[t]["C"], plan[t]["D"]]
-        for i, (n, g) in enumerate(seat_vals, start=1):
-            row[f"Seat{i}"] = f"{n} (G{g})" if n else ""
-        rows.append(row)
+    for s in seats:
+        rows.append(
+            {
+                "Day": day,
+                "Table": s.table_no,
+                "Seat": s.seat_no,
+                "Name": s.name,
+                "Grade": s.grade,
+                "Leader": "Yes" if s.leader else "",
+                "Absent": "Yes" if s.absent else "",
+            }
+        )
     return pd.DataFrame(rows)
 
 
-def render_chart(plan):
-    # Visual seating chart: Table cards in a grid
-    cols = st.columns(3)
-    i = 0
-    for t in sorted(plan.keys()):
-        with cols[i % 3]:
-            st.markdown(f"### Table {t}")
-            # 2x2 seat layout
-            grid = st.columns(2)
-            for idx, seat in enumerate(["A", "B", "C", "D"]):
-                name, grade = plan[t][seat]
-                label = f"{name} (G{grade})" if name else "—"
-                grid[idx % 2].markdown(
-                    f"<div style='border:1px solid #ccc;border-radius:10px;padding:10px;margin:6px;text-align:center;'>"
-                    f"<div style='font-size:12px;opacity:0.7'>Seat {seat}</div>"
-                    f"<div style='font-size:16px;font-weight:600'>{label}</div>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-        i += 1
+def render_table_cards(seats: List[Seat], seats_per_table: int = 4) -> None:
+    if not seats:
+        st.info("No seating generated for this day.")
+        return
+
+    # group by table
+    tables: Dict[int, List[Seat]] = {}
+    for s in seats:
+        tables.setdefault(s.table_no, []).append(s)
+
+    html = ['<div class="table-grid">']
+    for tno in sorted(tables.keys()):
+        members = sorted(tables[tno], key=lambda x: x.seat_no)
+        html.append('<div class="table-card">')
+        html.append('<div class="hdr">')
+        html.append(f'<div class="name">Table {tno}</div>')
+        html.append(f'<div class="table-pill">{seats_per_table} seats</div>')
+        html.append("</div>")
+        html.append('<div class="seats">')
+
+        for s in members:
+            is_empty = s.name == "(empty)"
+            cls = "seat"
+            if s.leader:
+                cls += " leader"
+            if s.absent:
+                cls += " absent"
+
+            badge = f"Seat {s.seat_no}"
+            display_name = s.name if not is_empty else "(empty)"
+            meta_bits = []
+            if s.grade:
+                meta_bits.append(f"Grade: {s.grade}")
+            if s.leader and not is_empty:
+                meta_bits.append("Team Leader")
+            if s.absent and not is_empty:
+                meta_bits.append("Absent")
+            meta = " · ".join(meta_bits) if meta_bits else ""
+
+            html.append(f'<div class="{cls}">')
+            html.append(f'<div class="badge">{badge}</div>')
+            html.append('<div>')
+            html.append(f'<div class="name">{display_name}</div>')
+            if meta:
+                html.append(f'<div class="meta">{meta}</div>')
+            html.append("</div>")
+            html.append("</div>")
+
+        html.append("</div>")
+        html.append("</div>")
+
+    html.append("</div>")
+    st.markdown("\n".join(html), unsafe_allow_html=True)
 
 
-# ----------------------------
-# Upload
-# ----------------------------
-uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
+# -------------------------
+# App
+# -------------------------
+st.set_page_config(page_title="Seat Planner", page_icon="🪑", layout="wide")
+st.markdown(APP_CSS, unsafe_allow_html=True)
 
-with st.expander("Required columns"):
-    st.code("School, Class, Day, Name, Grade", language="text")
+st.title("Seat Planner")
+st.caption("4 per table · Day-based rosters · Grade balancing · Table-view export")
+
+with st.sidebar:
+    st.header("Settings")
+    uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
+
+    st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
+
+    seats_per_table = st.number_input("Seats per table", min_value=2, max_value=10, value=4, step=1)
+    max_same_grade = st.number_input("Max same grade per table", min_value=1, max_value=4, value=2, step=1)
+
+    st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
+
+    auto_correct = st.toggle("Auto-correct School/Class mismatches", value=True)
+    strict_match = st.toggle("Strict match only (no correction)", value=False)
+
+    st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
+    export_mode = st.selectbox("Export format", ["CSV", "Excel"], index=0)
+    show_print_mode = st.toggle("Print-friendly mode", value=False)
+
+if show_print_mode:
+    st.markdown(
+        "<style>.block-container{max-width: 1050px;} .table-card{background:white !important; color:black !important;} .seat{background:#f6f6f6 !important; color:black !important;} .seat .meta{color:#333 !important;} .kpi{background:#f6f6f6 !important; color:black !important;}</style>",
+        unsafe_allow_html=True,
+    )
 
 if not uploaded:
-    st.info("Upload a file to begin.")
+    st.info("Upload a CSV/XLSX to begin. Required columns: School, Class, Name, Grade (Day optional).")
     st.stop()
 
 try:
-    df = load_file(uploaded)
-    require_cols(df, ["school", "class", "day", "name", "grade"])
-    df = clean_df(df)
+    df_raw = load_file(uploaded)
 except Exception as e:
-    st.error(str(e))
+    st.error(f"Could not read file: {e}")
     st.stop()
 
-# ----------------------------
-# Fixed dropdowns from registry
-# ----------------------------
-school = st.selectbox("School", sorted(SCHOOL_CLASS_REGISTRY.keys()))
-class_name = st.selectbox("Class", SCHOOL_CLASS_REGISTRY[school])
+df = ensure_columns(df_raw)
 
-# Filter file to selected school/class
-df_sc = df[(df["school"] == school) & (df["class"] == class_name)].copy()
+schools, classes_by_school = build_school_class_options(df)
 
-if df_sc.empty:
-    st.warning("No rows found in the uploaded file for this School/Class. Check spelling in the file.")
+# selectors
+colA, colB = st.columns([1, 1])
+with colA:
+    selected_school = st.selectbox("School", schools, index=0 if schools else None)
+with colB:
+    class_opts = classes_by_school.get(selected_school, [])
+    selected_class = st.selectbox("Class", class_opts, index=0 if class_opts else None)
+
+# mismatch handling
+df_school_vals = sorted({s for s in df["School"].map(norm_text) if s and s.lower() != "nan"})
+df_class_vals = sorted({c for c in df["Class"].map(norm_text) if c and c.lower() != "nan"})
+
+school_in_file = selected_school in df_school_vals
+class_in_file = selected_class in df_class_vals
+
+suggest_school = closest_match(selected_school, df_school_vals, cutoff=0.65) if not school_in_file else None
+suggest_class = closest_match(selected_class, df_class_vals, cutoff=0.65) if not class_in_file else None
+
+effective_school = selected_school
+effective_class = selected_class
+
+if strict_match:
+    auto_correct = False
+
+if auto_correct:
+    if (not school_in_file) and suggest_school:
+        effective_school = suggest_school
+        st.warning(f"School mismatch: using closest match found in file: {suggest_school}")
+    elif not school_in_file and df_school_vals:
+        st.warning("School mismatch: no close match found. Check spelling in the file.")
+
+    if (not class_in_file) and suggest_class:
+        effective_class = suggest_class
+        st.warning(f"Class mismatch: using closest match found in file: {suggest_class}")
+    elif not class_in_file and df_class_vals:
+        st.warning("Class mismatch: no close match found. Check spelling in the file.")
+else:
+    if not school_in_file and df_school_vals:
+        msg = f"School not found in file."
+        if suggest_school:
+            msg += f" Suggestion: {suggest_school}"
+        st.warning(msg)
+    if not class_in_file and df_class_vals:
+        msg = f"Class not found in file."
+        if suggest_class:
+            msg += f" Suggestion: {suggest_class}"
+        st.warning(msg)
+
+# filter
+filtered = df[(df["School"] == effective_school) & (df["Class"] == effective_class)].copy()
+
+# if nothing, show diagnostic
+if filtered.empty:
+    st.error("No rows found for the selected School/Class (after any auto-correction).")
+    with st.expander("Quick diagnostic"):
+        st.write("Schools found in file:", df_school_vals[:50])
+        st.write("Classes found in file:", df_class_vals[:50])
+        st.write("First 20 rows preview:")
+        st.dataframe(df.head(20), use_container_width=True)
     st.stop()
 
-# Day options from the file for this class
-day_options = sorted(df_sc["day"].unique().tolist())
+# KPIs
+total_students = filtered["Name"].astype(str).str.strip().ne("").sum()
+unique_students = filtered["Name"].astype(str).str.strip().nunique()
+grades_present = sorted({g for g in filtered["Grade"].astype(str) if g and g.lower() != "nan"})
+days_detected = sorted({d for d in filtered["Day"].astype(str) if d and d.lower() != "nan"})
 
-# ----------------------------
-# Controls
-# ----------------------------
-c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
-with c1:
-    lock_week = st.checkbox("Generate whole week", value=False)
-with c2:
-    selected_date = st.date_input("Pick a date (for week)", value=dt.date.today())
-with c3:
-    rotate = st.checkbox("Rotate seats by day", value=True)
-with c4:
-    enforce = st.checkbox("Limit same-grade per table", value=True)
+st.markdown(
+    f"""
+<div class="kpi-row">
+  <div class="kpi"><div class="label">School</div><div class="value">{effective_school}</div></div>
+  <div class="kpi"><div class="label">Class</div><div class="value">{effective_class}</div></div>
+  <div class="kpi"><div class="label">Rows</div><div class="value">{len(filtered)}</div></div>
+  <div class="kpi"><div class="label">Students (rows)</div><div class="value">{total_students}</div></div>
+  <div class="kpi"><div class="label">Unique names</div><div class="value">{unique_students}</div></div>
+</div>
+<p class="small-muted">Grades in file: {", ".join(grades_present) if grades_present else "n/a"} · Days in file: {", ".join(days_detected) if days_detected else "n/a"}</p>
+""",
+    unsafe_allow_html=True,
+)
 
-week_start = monday_of_week(selected_date)
-st.caption(f"Week starts: {week_start.isoformat()}")
+st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
 
-if enforce:
-    max_same = st.number_input("Max same grade per table", min_value=1, max_value=4, value=2, step=1)
-else:
-    max_same = None
+# day tabs
+days = DEFAULT_DAYS
+day_map = split_by_day(filtered, days)
 
-use_seed = st.checkbox("Use seed (repeatable results)", value=True)
-seed_val = st.number_input("Seed", min_value=0, max_value=999999, value=42, step=1, disabled=not use_seed)
+tabs = st.tabs(days)
 
-if not lock_week:
-    day = st.selectbox("Day", day_options)
-else:
-    # Use Mon–Fri order where possible, but only include days present in the file
-    ordered = [d for d in DAY_ORDER if d in day_options] + [d for d in day_options if d not in DAY_ORDER]
-    day = None
-    day_options = ordered
+all_exports = []
 
-st.divider()
+for i, day in enumerate(days):
+    with tabs[i]:
+        df_day = day_map.get(day, pd.DataFrame(columns=filtered.columns))
 
-# ----------------------------
-# Generate
-# ----------------------------
-if st.button("Generate seating", type="primary", use_container_width=True):
-    outputs = []  # list of (day, plan, table_df)
+        # rotation per day (stable)
+        rotate_offset = i
 
-    run_days = day_options if lock_week else [day]
-    for d in run_days:
-        df_day = df_sc[df_sc["day"] == d].copy()
-        df_day = df_day.drop_duplicates(subset=["name"])  # dedupe within day only
-
-        absent = st.session_state.get(f"absent_{d}", [])
-        present = df_day[~df_day["name"].isin(absent)].copy()
-
-        if present.empty:
-            plan = {1: {s: ("", "") for s in SEATS}}
-            tdf = plan_to_tableview_df(plan, school, class_name, week_start, d)
-            outputs.append((d, plan, tdf))
-            continue
-
-        tables = tables_needed(len(present))
-
-        # Build deterministic seed per day if locked-week
-        if use_seed:
-            seed = stable_seed(seed_val, school, class_name, week_start.isoformat(), d)
-        else:
-            seed = None
-
-        present_rows = [{"name": r["name"], "grade": r["grade"]} for _, r in present.iterrows()]
-        built = build_tables_with_constraints(
-            present_rows=present_rows,
-            num_tables=int(tables),
-            max_same_grade=max_same,
-            attempts=500,
-            seed=seed,
+        seats = generate_plan_for_day(
+            df_day=df_day,
+            seats_per_table=int(seats_per_table),
+            max_same_grade_per_table=int(max_same_grade),
+            rotate_offset=rotate_offset,
         )
 
-        if built is None:
-            st.error(
-                f"Could not satisfy grade constraint for {d}. "
-                "Try increasing 'Max same grade per table' or turning the constraint off."
-            )
-            st.stop()
+        left, right = st.columns([1.25, 1])
+        with left:
+            st.subheader("Seating chart")
+            render_table_cards(seats, seats_per_table=int(seats_per_table))
 
-        plan = tables_to_plan(built, day=d, rotate_seats=rotate)
-        tdf = plan_to_tableview_df(plan, school, class_name, week_start, d)
-        outputs.append((d, plan, tdf))
+        with right:
+            st.subheader("Table view")
+            df_out = seats_to_dataframe(seats, day=day)
+            st.dataframe(df_out, use_container_width=True, height=440)
+            all_exports.append(df_out)
 
-    st.session_state["outputs"] = outputs
-    st.success("Seating generated.")
+            st.caption("Leader highlighting uses Role column (Leader/TL) or name markers like ★ or '(TL)'. Absence uses Status column or '(Absent)' in name.")
 
+# export
+export_df = pd.concat(all_exports, ignore_index=True) if all_exports else pd.DataFrame()
 
-# ----------------------------
-# Absences UI (per day)
-# ----------------------------
-st.subheader("Absences (optional)")
-if lock_week:
-    tabs = st.tabs(day_options)
-    for i, d in enumerate(day_options):
-        with tabs[i]:
-            roster = df_sc[df_sc["day"] == d].drop_duplicates(subset=["name"])["name"].tolist()
-            st.session_state[f"absent_{d}"] = st.multiselect("Absent today", roster, key=f"abs_{d}")
+st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
+st.subheader("Export")
+
+if export_df.empty:
+    st.info("Nothing to export yet.")
 else:
-    roster = df_sc[df_sc["day"] == day].drop_duplicates(subset=["name"])["name"].tolist()
-    st.session_state[f"absent_{day}"] = st.multiselect("Absent today", roster, key=f"abs_{day}")
-
-st.divider()
-
-# ----------------------------
-# Display + Export (table view)
-# ----------------------------
-if "outputs" in st.session_state:
-    outputs = st.session_state["outputs"]
-
-    if lock_week:
-        st.subheader(f"{school} • {class_name} • Week of {week_start.isoformat()}")
-        all_df = pd.concat([tdf for _, _, tdf in outputs], ignore_index=True)
-
-        for d, plan, _ in outputs:
-            st.markdown(f"## {d}")
-            render_chart(plan)
-            st.divider()
-
-        csv_bytes = all_df.to_csv(index=False).encode("utf-8-sig")
+    if export_mode == "CSV":
+        csv_bytes = export_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download WEEK (table view CSV)",
+            "Download seating plan (CSV)",
             data=csv_bytes,
-            file_name=f"{school}_{class_name}_week_{week_start.isoformat()}.csv".replace(" ", "_"),
+            file_name=f"seating_plan_{norm_key(effective_school)}_{norm_key(effective_class)}.csv",
             mime="text/csv",
-            use_container_width=True
         )
-
-        st.dataframe(all_df, use_container_width=True)
-
     else:
-        d, plan, tdf = outputs[0]
-        st.subheader(f"{school} • {class_name} • {d}")
-        render_chart(plan)
-
-        csv_bytes = tdf.to_csv(index=False).encode("utf-8-sig")
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            export_df.to_excel(writer, index=False, sheet_name="SeatingPlan")
         st.download_button(
-            "Download DAY (table view CSV)",
-            data=csv_bytes,
-            file_name=f"{school}_{class_name}_{d}_week_{week_start.isoformat()}.csv".replace(" ", "_"),
-            mime="text/csv",
-            use_container_width=True
+            "Download seating plan (Excel)",
+            data=out.getvalue(),
+            file_name=f"seating_plan_{norm_key(effective_school)}_{norm_key(effective_class)}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        st.dataframe(tdf, use_container_width=True)
+with st.expander("Preview uploaded data"):
+    st.dataframe(filtered.head(50), use_container_width=True)
