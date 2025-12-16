@@ -35,6 +35,9 @@ APP_CSS = """
   --good: #86efac;
   --warn: #fde68a;
   --bad: #fca5a5;
+  --leader: rgba(253,230,138,0.30);
+  --leader-strong: rgba(253,230,138,0.55);
+  --absent: rgba(252,165,165,0.30);
 }
 
 .block-container{ padding-top: 1.6rem; padding-bottom: 2rem; }
@@ -92,7 +95,7 @@ h1, h2, h3{ letter-spacing: .2px; }
   border-radius: 12px;
   padding: 8px 10px;
   display:flex;
-  gap: 8px;
+  gap: 10px;
   align-items: flex-start;
 }
 .seat .badge{
@@ -105,7 +108,7 @@ h1, h2, h3{ letter-spacing: .2px; }
   white-space: nowrap;
 }
 .seat .name{
-  font-weight: 600;
+  font-weight: 700;
   line-height: 1.2;
 }
 .seat .meta{
@@ -114,19 +117,48 @@ h1, h2, h3{ letter-spacing: .2px; }
   margin-top: 2px;
   line-height: 1.2;
 }
+
+.seat .tag{
+  margin-left:auto;
+  font-size: 0.72rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.20);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.90);
+}
+.seat .tag.leader{
+  border-color: var(--leader-strong);
+  background: var(--leader);
+  color: rgba(255,255,255,0.95);
+  font-weight: 700;
+}
+.seat .tag.absent{
+  border-color: rgba(252,165,165,0.55);
+  background: var(--absent);
+  font-weight: 700;
+}
+
 .seat.leader{
-  border-color: rgba(253,230,138,0.55);
-  background: rgba(253,230,138,0.10);
+  border-color: var(--leader-strong);
+  background: var(--leader);
+  box-shadow: 0 0 0 1px rgba(253,230,138,0.25) inset;
 }
 .seat.absent{
   opacity: 0.55;
   filter: grayscale(25%);
   text-decoration: line-through;
 }
+
 .hr-soft{
   border:0; height:1px;
   background: rgba(255,255,255,0.10);
   margin: 14px 0;
+}
+
+.note{
+  color: var(--muted);
+  font-size: 0.90rem;
 }
 </style>
 """
@@ -219,9 +251,7 @@ def build_school_class_options(df: pd.DataFrame) -> Tuple[List[str], Dict[str, L
     classes_by_school: Dict[str, List[str]] = {}
     for sch in schools:
         base = CANONICAL.get(sch, [])
-        # add any classes seen in file for this school too
         in_file = sorted({c for c in df.loc[df["School"] == sch, "Class"].astype(str).map(norm_text) if c and c.lower() != "nan"})
-        # if nothing for this school in file, still allow discovered global classes (teacher may be selecting before fixing file)
         merged = sorted(set(base + in_file))
         if not merged and discovered_classes:
             merged = discovered_classes
@@ -236,7 +266,6 @@ def detect_leader(row: pd.Series) -> bool:
 
     if "leader" in role or role in ["tl", "team leader", "teamleader"]:
         return True
-    # common teacher patterns
     if re.search(r"\b(tl|leader)\b", norm_key(name)):
         return True
     if "★" in name or "☆" in name:
@@ -254,6 +283,11 @@ def detect_absent(row: pd.Series) -> bool:
     return False
 
 
+def make_student_key(school: str, clazz: str, name: str, grade: str) -> str:
+    # stable identity for attendance toggles (avoid same-name collisions across classes)
+    return f"{norm_text(school)}||{norm_text(clazz)}||{norm_text(name)}||{norm_text(grade)}"
+
+
 @dataclass
 class Seat:
     table_no: int
@@ -265,7 +299,6 @@ class Seat:
 
 
 def grade_key(g: str) -> Tuple[int, str]:
-    # try to parse numeric grade, else keep as string
     t = norm_key(g)
     m = re.search(r"(\d+)", t)
     if m:
@@ -274,11 +307,9 @@ def grade_key(g: str) -> Tuple[int, str]:
 
 
 def split_by_day(df: pd.DataFrame, days: List[str]) -> Dict[str, pd.DataFrame]:
-    # if file has explicit Day values, use them; otherwise treat all students as eligible every day
     if df["Day"].astype(str).str.strip().replace("nan", "").eq("").all():
         return {d: df.copy() for d in days}
 
-    # normalize day strings in file loosely (Mon/Monday etc.)
     def normalize_day(x: str) -> str:
         xk = norm_key(x)
         if xk.startswith("mon"):
@@ -313,14 +344,15 @@ def generate_plan_for_day(
     max_same_grade_per_table: int = 2,
     rotate_offset: int = 0,
 ) -> List[Seat]:
-    # remove empty names
     roster = df_day.copy()
     roster = roster[roster["Name"].astype(str).str.strip().ne("")]
     if roster.empty:
         return []
 
-    # stable rotation: rotate order, then seat
-    roster = roster.sort_values(["Grade", "Name"], key=lambda s: s.map(lambda v: grade_key(v)[0] if s.name == "Grade" else norm_text(v)))
+    roster = roster.sort_values(
+        ["Grade", "Name"],
+        key=lambda s: s.map(lambda v: grade_key(v)[0] if s.name == "Grade" else norm_text(v)),
+    )
     roster_list = roster.to_dict(orient="records")
 
     if roster_list:
@@ -330,11 +362,9 @@ def generate_plan_for_day(
     n_students = len(roster_list)
     n_tables = max(1, math.ceil(n_students / seats_per_table))
 
-    # grade balancing with simple greedy constraint per table
     tables: List[List[dict]] = [[] for _ in range(n_tables)]
     grade_counts: List[Dict[str, int]] = [dict() for _ in range(n_tables)]
 
-    # sort by grade frequency first (more constrained first)
     grades = [r.get("Grade", "") for r in roster_list]
     freq: Dict[str, int] = {}
     for g in grades:
@@ -346,7 +376,6 @@ def generate_plan_for_day(
         g = r.get("Grade", "")
         placed = False
 
-        # try tables with fewer members first
         table_order = sorted(range(n_tables), key=lambda i: (len(tables[i]), grade_counts[i].get(g, 0)))
 
         for ti in table_order:
@@ -359,7 +388,6 @@ def generate_plan_for_day(
             placed = True
             break
 
-        # fallback: ignore grade limit if needed
         if not placed:
             for ti in table_order:
                 if len(tables[ti]) < seats_per_table:
@@ -367,7 +395,6 @@ def generate_plan_for_day(
                     grade_counts[ti][g] = grade_counts[ti].get(g, 0) + 1
                     break
 
-    # flatten into Seat list
     out: List[Seat] = []
     for t_idx, members in enumerate(tables, start=1):
         for s_idx in range(seats_per_table):
@@ -407,11 +434,27 @@ def seats_to_dataframe(seats: List[Seat], day: str) -> pd.DataFrame:
                 "Seat": s.seat_no,
                 "Name": s.name,
                 "Grade": s.grade,
-                "Leader": "Yes" if s.leader else "",
+                "Leader": "TL" if s.leader else "",
                 "Absent": "Yes" if s.absent else "",
             }
         )
     return pd.DataFrame(rows)
+
+
+def style_table(df_out: pd.DataFrame) -> pd.io.formats.style.Styler:
+    def row_style(r):
+        styles = []
+        is_leader = str(r.get("Leader", "")).strip() != ""
+        is_absent = str(r.get("Absent", "")).strip() != ""
+        if is_absent:
+            styles.append("opacity:0.55;")
+            styles.append("text-decoration: line-through;")
+        if is_leader:
+            styles.append("background-color: rgba(253,230,138,0.18);")
+            styles.append("font-weight: 700;")
+        return ["".join(styles)] * len(r)
+
+    return df_out.style.apply(row_style, axis=1)
 
 
 def render_table_cards(seats: List[Seat], seats_per_table: int = 4) -> None:
@@ -419,7 +462,6 @@ def render_table_cards(seats: List[Seat], seats_per_table: int = 4) -> None:
         st.info("No seating generated for this day.")
         return
 
-    # group by table
     tables: Dict[int, List[Seat]] = {}
     for s in seats:
         tables.setdefault(s.table_no, []).append(s)
@@ -447,19 +489,23 @@ def render_table_cards(seats: List[Seat], seats_per_table: int = 4) -> None:
             meta_bits = []
             if s.grade:
                 meta_bits.append(f"Grade: {s.grade}")
-            if s.leader and not is_empty:
-                meta_bits.append("Team Leader")
-            if s.absent and not is_empty:
-                meta_bits.append("Absent")
             meta = " · ".join(meta_bits) if meta_bits else ""
+
+            tag_html = ""
+            if s.leader and not is_empty:
+                tag_html += '<span class="tag leader">TL</span>'
+            if s.absent and not is_empty:
+                tag_html += '<span class="tag absent">ABSENT</span>'
 
             html.append(f'<div class="{cls}">')
             html.append(f'<div class="badge">{badge}</div>')
-            html.append('<div>')
+            html.append('<div style="flex:1;">')
             html.append(f'<div class="name">{display_name}</div>')
             if meta:
                 html.append(f'<div class="meta">{meta}</div>')
             html.append("</div>")
+            if tag_html:
+                html.append(f'<div style="display:flex; gap:6px; align-items:flex-start;">{tag_html}</div>')
             html.append("</div>")
 
         html.append("</div>")
@@ -467,6 +513,19 @@ def render_table_cards(seats: List[Seat], seats_per_table: int = 4) -> None:
 
     html.append("</div>")
     st.markdown("\n".join(html), unsafe_allow_html=True)
+
+
+def init_absence_state(days: List[str]) -> None:
+    if "absent_by_day" not in st.session_state:
+        st.session_state["absent_by_day"] = {d: set() for d in days}
+
+
+def set_absences_for_day(day: str, new_set: set) -> None:
+    st.session_state["absent_by_day"][day] = set(new_set)
+
+
+def get_absences_for_day(day: str) -> set:
+    return set(st.session_state["absent_by_day"].get(day, set()))
 
 
 # -------------------------
@@ -514,6 +573,9 @@ except Exception as e:
 
 df = ensure_columns(df_raw)
 
+# add stable student key (for session-only attendance)
+df["StudentKey"] = df.apply(lambda r: make_student_key(r["School"], r["Class"], r["Name"], r["Grade"]), axis=1)
+
 schools, classes_by_school = build_school_class_options(df)
 
 # selectors
@@ -554,12 +616,12 @@ if auto_correct:
         st.warning("Class mismatch: no close match found. Check spelling in the file.")
 else:
     if not school_in_file and df_school_vals:
-        msg = f"School not found in file."
+        msg = "School not found in file."
         if suggest_school:
             msg += f" Suggestion: {suggest_school}"
         st.warning(msg)
     if not class_in_file and df_class_vals:
-        msg = f"Class not found in file."
+        msg = "Class not found in file."
         if suggest_class:
             msg += f" Suggestion: {suggest_class}"
         st.warning(msg)
@@ -567,7 +629,6 @@ else:
 # filter
 filtered = df[(df["School"] == effective_school) & (df["Class"] == effective_class)].copy()
 
-# if nothing, show diagnostic
 if filtered.empty:
     st.error("No rows found for the selected School/Class (after any auto-correction).")
     with st.expander("Quick diagnostic"):
@@ -599,19 +660,97 @@ st.markdown(
 
 st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
 
-# day tabs
+# day tabs + day map
 days = DEFAULT_DAYS
 day_map = split_by_day(filtered, days)
 
-tabs = st.tabs(days)
+# -------------------------
+# Session-only Attendance UI (sidebar)
+# -------------------------
+init_absence_state(days)
 
+with st.sidebar:
+    st.subheader("Attendance (session-only)")
+    st.caption("Tick absent kids for a day. This only lasts for this browser session.")
+
+    attendance_day = st.selectbox("Mark absences for day", days, index=0)
+    absent_search = st.text_input("Search student", value="", placeholder="Type a name…")
+
+    df_att = day_map.get(attendance_day, pd.DataFrame(columns=filtered.columns)).copy()
+    if not df_att.empty:
+        # unique list for the day
+        df_att = df_att[df_att["Name"].astype(str).str.strip().ne("")]
+        df_att["IsLeader"] = df_att.apply(lambda r: detect_leader(pd.Series(r)), axis=1)
+        df_att["DefaultAbsent"] = df_att.apply(lambda r: detect_absent(pd.Series(r)), axis=1)
+
+        att_unique = (
+            df_att[["StudentKey", "Name", "Grade", "IsLeader", "DefaultAbsent"]]
+            .drop_duplicates(subset=["StudentKey"])
+            .copy()
+        )
+
+        # seed with file-based absent markers + existing session state
+        current_abs = get_absences_for_day(attendance_day)
+        seeded = set(att_unique.loc[att_unique["DefaultAbsent"], "StudentKey"].tolist())
+        current_abs = set(current_abs) | seeded
+        set_absences_for_day(attendance_day, current_abs)
+
+        # filter by search
+        if absent_search.strip():
+            q = norm_key(absent_search)
+            att_unique = att_unique[att_unique["Name"].astype(str).map(lambda x: q in norm_key(x))]
+
+        # show editor checklist (best "click to mark absent" UX)
+        ui_df = att_unique.copy()
+        ui_df["Absent"] = ui_df["StudentKey"].isin(get_absences_for_day(attendance_day))
+        ui_df["TL"] = ui_df["IsLeader"].map(lambda x: "TL" if x else "")
+        ui_df = ui_df[["Absent", "Name", "Grade", "TL", "StudentKey"]]
+
+        edited = st.data_editor(
+            ui_df,
+            hide_index=True,
+            use_container_width=True,
+            height=320,
+            column_config={
+                "Absent": st.column_config.CheckboxColumn("Absent", help="Tick if absent today"),
+                "Name": st.column_config.TextColumn("Name"),
+                "Grade": st.column_config.TextColumn("Grade"),
+                "TL": st.column_config.TextColumn("TL"),
+                "StudentKey": st.column_config.TextColumn("StudentKey", disabled=True),
+            },
+            disabled=["StudentKey"],
+            key=f"att_editor_{effective_school}_{effective_class}_{attendance_day}",
+        )
+
+        new_abs = set(edited.loc[edited["Absent"] == True, "StudentKey"].tolist())
+        set_absences_for_day(attendance_day, new_abs)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Clear absences (this day)"):
+                set_absences_for_day(attendance_day, set())
+                st.rerun()
+        with c2:
+            st.write(f"Absent: {len(get_absences_for_day(attendance_day))}")
+
+    else:
+        st.info("No roster rows for this day (based on your file).")
+
+st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
+
+tabs = st.tabs(days)
 all_exports = []
 
 for i, day in enumerate(days):
     with tabs[i]:
-        df_day = day_map.get(day, pd.DataFrame(columns=filtered.columns))
+        df_day = day_map.get(day, pd.DataFrame(columns=filtered.columns)).copy()
 
-        # rotation per day (stable)
+        # apply session-only absences: REMOVE absent kids from generation for this day
+        if not df_day.empty:
+            abs_set = get_absences_for_day(day)
+            if abs_set:
+                df_day = df_day[~df_day["StudentKey"].isin(abs_set)].copy()
+
         rotate_offset = i
 
         seats = generate_plan_for_day(
@@ -629,10 +768,16 @@ for i, day in enumerate(days):
         with right:
             st.subheader("Table view")
             df_out = seats_to_dataframe(seats, day=day)
-            st.dataframe(df_out, use_container_width=True, height=440)
+
+            # stronger table visuals
+            try:
+                st.dataframe(style_table(df_out), use_container_width=True, height=440)
+            except Exception:
+                st.dataframe(df_out, use_container_width=True, height=440)
+
             all_exports.append(df_out)
 
-            st.caption("Leader highlighting uses Role column (Leader/TL) or name markers like ★ or '(TL)'. Absence uses Status column or '(Absent)' in name.")
+            st.caption("TL highlighting uses Role column (Leader/TL) or ★ / '(TL)' in the name. Absence for generation is controlled by the sidebar checklist (session-only).")
 
 # export
 export_df = pd.concat(all_exports, ignore_index=True) if all_exports else pd.DataFrame()
