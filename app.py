@@ -441,7 +441,8 @@ def seats_to_dataframe(seats: List[Seat], day: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def style_table(df_out: pd.DataFrame) -> pd.io.formats.style.Styler:
+def style_table(df_out: pd.DataFrame):
+
     def row_style(r):
         styles = []
         is_leader = str(r.get("Leader", "")).strip() != ""
