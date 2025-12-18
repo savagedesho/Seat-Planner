@@ -32,14 +32,11 @@ APP_CSS = """
   --card-border: rgba(255,255,255,0.10);
   --muted: rgba(255,255,255,0.65);
   --accent: #7dd3fc;
-  --good: #86efac;
   --warn: #fde68a;
   --bad: #fca5a5;
   --leader: rgba(253,230,138,0.30);
   --leader-strong: rgba(253,230,138,0.55);
   --absent: rgba(252,165,165,0.30);
-  --girl: rgba(236,72,153,0.18);
-  --boy: rgba(59,130,246,0.18);
 }
 
 .block-container{ padding-top: 1.6rem; padding-bottom: 2rem; }
@@ -110,7 +107,7 @@ h1, h2, h3{ letter-spacing: .2px; }
   white-space: nowrap;
 }
 .seat .name{
-  font-weight: 700;
+  font-weight: 800;
   line-height: 1.2;
 }
 .seat .meta{
@@ -140,14 +137,6 @@ h1, h2, h3{ letter-spacing: .2px; }
   background: var(--absent);
   font-weight: 800;
 }
-.seat .tag.girl{
-  border-color: rgba(236,72,153,0.35);
-  background: var(--girl);
-}
-.seat .tag.boy{
-  border-color: rgba(59,130,246,0.35);
-  background: var(--boy);
-}
 
 .seat.leader{
   border-color: var(--leader-strong);
@@ -169,6 +158,46 @@ h1, h2, h3{ letter-spacing: .2px; }
 .note{
   color: var(--muted);
   font-size: 0.90rem;
+}
+
+.floor-grid{
+  display:grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+.floor-box{
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 16px;
+  padding: 12px;
+  background: rgba(255,255,255,0.05);
+}
+.floor-hdr{
+  display:flex;
+  justify-content: space-between;
+  align-items:center;
+  margin-bottom: 8px;
+}
+.floor-title{
+  font-weight: 900;
+  font-size: 1.05rem;
+}
+.floor-lines{
+  line-height: 1.65;
+}
+.floor-line{
+  display:flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.floor-line .left{
+  overflow:hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.floor-line .right{
+  color: rgba(255,255,255,0.75);
+  white-space: nowrap;
 }
 </style>
 """
@@ -197,15 +226,6 @@ def closest_match(query: str, choices: List[str], cutoff: float = 0.72) -> Optio
         return None
     matches = get_close_matches(query, choices, n=1, cutoff=cutoff)
     return matches[0] if matches else None
-
-
-def normalize_gender(x: str) -> str:
-    xk = norm_key(x)
-    if xk in ["g", "girl", "girls", "female", "f"]:
-        return "G"
-    if xk in ["b", "boy", "boys", "male", "m"]:
-        return "B"
-    return ""
 
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -242,7 +262,16 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["School", "Class", "Name", "Grade", "Day", "Role", "Status", "Gender"]:
         df[c] = df[c].astype(str).map(norm_text)
 
-    df["Gender"] = df["Gender"].map(normalize_gender)
+    # normalize gender to G/B or blank
+    def norm_gender(x: str) -> str:
+        xk = norm_key(x)
+        if xk in ["g", "girl", "girls", "female", "f"]:
+            return "G"
+        if xk in ["b", "boy", "boys", "male", "m"]:
+            return "B"
+        return "" if xk in ["nan", "none"] else norm_text(x)
+
+    df["Gender"] = df["Gender"].map(norm_gender)
 
     return df
 
@@ -275,19 +304,6 @@ def build_school_class_options(df: pd.DataFrame) -> Tuple[List[str], Dict[str, L
     return schools, classes_by_school
 
 
-def detect_leader(row: pd.Series) -> bool:
-    role = norm_key(row.get("Role", ""))
-    name = norm_text(row.get("Name", ""))
-
-    if "leader" in role or role in ["tl", "team leader", "teamleader"]:
-        return True
-    if re.search(r"\b(tl|leader)\b", norm_key(name)):
-        return True
-    if "★" in name or "☆" in name:
-        return True
-    return False
-
-
 def detect_absent(row: pd.Series) -> bool:
     status = norm_key(row.get("Status", ""))
     name = norm_key(row.get("Name", ""))
@@ -300,18 +316,6 @@ def detect_absent(row: pd.Series) -> bool:
 
 def make_student_key(school: str, clazz: str, name: str, grade: str) -> str:
     return f"{norm_text(school)}||{norm_text(clazz)}||{norm_text(name)}||{norm_text(grade)}"
-
-
-@dataclass
-class Seat:
-    table_no: int
-    seat_no: int
-    name: str
-    grade: str
-    gender: str
-    student_key: str
-    leader: bool
-    absent: bool
 
 
 def grade_key(g: str) -> Tuple[int, str]:
@@ -354,212 +358,21 @@ def split_by_day(df: pd.DataFrame, days: List[str]) -> Dict[str, pd.DataFrame]:
     return out
 
 
-def init_absence_state(days: List[str]) -> None:
-    if "absent_by_day" not in st.session_state:
-        st.session_state["absent_by_day"] = {d: set() for d in days}
+@dataclass
+class Seat:
+    table_no: int
+    seat_no: int
+    name: str
+    grade: str
+    gender: str
+    leader: bool
+    absent: bool
+    student_key: str
 
 
-def set_absences_for_day(day: str, new_set: set) -> None:
-    st.session_state["absent_by_day"][day] = set(new_set)
-
-
-def get_absences_for_day(day: str) -> set:
-    return set(st.session_state["absent_by_day"].get(day, set()))
-
-
-def init_table_count_state(days: List[str]) -> None:
-    if "tables_fixed_by_day" not in st.session_state:
-        st.session_state["tables_fixed_by_day"] = {d: False for d in days}
-    if "tables_count_by_day" not in st.session_state:
-        st.session_state["tables_count_by_day"] = {d: 0 for d in days}  # 0 means Auto
-
-
-def init_leader_state(days: List[str]) -> None:
-    if "tl_by_day_table" not in st.session_state:
-        st.session_state["tl_by_day_table"] = {d: {} for d in days}  # day -> {table_no: student_key}
-
-
-def set_tl(day: str, table_no: int, student_key: str) -> None:
-    st.session_state["tl_by_day_table"].setdefault(day, {})
-    st.session_state["tl_by_day_table"][day][int(table_no)] = student_key or ""
-
-
-def get_tl(day: str, table_no: int) -> str:
-    return str(st.session_state.get("tl_by_day_table", {}).get(day, {}).get(int(table_no), "") or "")
-
-
-def compute_target_gender_per_table(seats_per_table: int) -> Dict[str, int]:
-    # For 4 seats => target 2G 2B. For odd sizes, keep "balanced-ish".
-    if seats_per_table <= 0:
-        return {"G": 0, "B": 0}
-    half = seats_per_table // 2
-    if seats_per_table % 2 == 0:
-        return {"G": half, "B": half}
-    # odd: allow 1 extra either way; we target half/half, leaving one flexible
-    return {"G": half, "B": half}
-
-
-def generate_plan_for_day(
-    df_day: pd.DataFrame,
-    seats_per_table: int = 4,
-    max_same_grade_per_table: int = 2,
-    rotate_offset: int = 0,
-    fixed_tables: Optional[int] = None,
-    prefer_gender_balance: bool = True,
-) -> List[Seat]:
-    roster = df_day.copy()
-    roster = roster[roster["Name"].astype(str).str.strip().ne("")]
-    if roster.empty:
-        return []
-
-    # stable ordering with rotation
-    roster = roster.sort_values(
-        ["Grade", "Name"],
-        key=lambda s: s.map(lambda v: grade_key(v)[0] if s.name == "Grade" else norm_text(v)),
-    )
-    roster_list = roster.to_dict(orient="records")
-
-    if roster_list:
-        rotate_offset = rotate_offset % len(roster_list)
-        roster_list = roster_list[rotate_offset:] + roster_list[:rotate_offset]
-
-    n_students = len(roster_list)
-    auto_tables = max(1, math.ceil(n_students / seats_per_table))
-    n_tables = auto_tables
-    if fixed_tables is not None and fixed_tables > 0:
-        n_tables = max(1, int(fixed_tables))
-
-    tables: List[List[dict]] = [[] for _ in range(n_tables)]
-    grade_counts: List[Dict[str, int]] = [dict() for _ in range(n_tables)]
-    gender_counts: List[Dict[str, int]] = [dict() for _ in range(n_tables)]
-
-    # more constrained first (grade frequency, then gender known vs unknown)
-    grades = [r.get("Grade", "") for r in roster_list]
-    freq: Dict[str, int] = {}
-    for g in grades:
-        freq[g] = freq.get(g, 0) + 1
-
-    def gender_priority(r):
-        g = normalize_gender(r.get("Gender", ""))
-        return 0 if g in ["G", "B"] else 1
-
-    roster_list.sort(
-        key=lambda r: (
-            gender_priority(r),
-            -freq.get(r.get("Grade", ""), 0),
-            grade_key(r.get("Grade", ""))[0],
-            norm_text(r.get("Name", "")),
-        )
-    )
-
-    target = compute_target_gender_per_table(seats_per_table)
-
-    def score_table(ti: int, r: dict) -> Tuple[int, int, int, int]:
-        """Lower is better."""
-        g = normalize_gender(r.get("Gender", ""))
-        grade = r.get("Grade", "")
-
-        size_penalty = len(tables[ti])  # keep filling evenly
-        grade_penalty = grade_counts[ti].get(grade, 0)
-        gender_penalty = 0
-
-        if prefer_gender_balance and g in ["G", "B"] and seats_per_table == 4:
-            # soft penalty if table already has 2 of that gender
-            if gender_counts[ti].get(g, 0) >= target.get(g, 2):
-                gender_penalty += 2
-            # extra bonus (i.e. lower penalty) if table currently has imbalance and this helps
-            # (handled by gender_penalty remaining small)
-        elif prefer_gender_balance and g in ["G", "B"]:
-            # for non-4 seats, still avoid extremes where possible
-            if gender_counts[ti].get(g, 0) >= target.get(g, 0) + 1:
-                gender_penalty += 1
-
-        # also gently penalize creating all-one-gender tables early
-        if prefer_gender_balance and g in ["G", "B"] and len(tables[ti]) >= 2:
-            other = "B" if g == "G" else "G"
-            if gender_counts[ti].get(other, 0) == 0 and gender_counts[ti].get(g, 0) >= 2:
-                gender_penalty += 2
-
-        return (size_penalty, gender_penalty, grade_penalty, ti)
-
-    for r in roster_list:
-        grade = r.get("Grade", "")
-        g = normalize_gender(r.get("Gender", ""))
-
-        # if fixed tables is set, seats may overflow; allow seating beyond capacity by spilling later into more "tables" visually
-        # but in practice you want fixed tables high enough. We'll still try to respect seat capacity when possible.
-        placed = False
-
-        # prefer tables that aren't full
-        table_order = sorted(range(n_tables), key=lambda i: score_table(i, r))
-
-        for ti in table_order:
-            if len(tables[ti]) >= seats_per_table:
-                continue
-            if grade_counts[ti].get(grade, 0) >= max_same_grade_per_table:
-                continue
-            tables[ti].append(r)
-            grade_counts[ti][grade] = grade_counts[ti].get(grade, 0) + 1
-            if g in ["G", "B"]:
-                gender_counts[ti][g] = gender_counts[ti].get(g, 0) + 1
-            placed = True
-            break
-
-        if not placed:
-            # relax grade constraint
-            for ti in table_order:
-                if len(tables[ti]) < seats_per_table:
-                    tables[ti].append(r)
-                    grade_counts[ti][grade] = grade_counts[ti].get(grade, 0) + 1
-                    if g in ["G", "B"]:
-                        gender_counts[ti][g] = gender_counts[ti].get(g, 0) + 1
-                    placed = True
-                    break
-
-        if not placed and fixed_tables is not None and fixed_tables > 0:
-            # all tables full: add overflow by appending to last table (won't display beyond 4 seats anyway)
-            tables[-1].append(r)
-
-    out: List[Seat] = []
-    for t_idx, members in enumerate(tables, start=1):
-        # only show up to seats_per_table seats (UI is fixed)
-        for s_idx in range(seats_per_table):
-            if s_idx < len(members):
-                m = members[s_idx]
-                out.append(
-                    Seat(
-                        table_no=t_idx,
-                        seat_no=s_idx + 1,
-                        name=norm_text(m.get("Name", "")),
-                        grade=norm_text(m.get("Grade", "")),
-                        gender=normalize_gender(m.get("Gender", "")),
-                        student_key=norm_text(m.get("StudentKey", "")),
-                        leader=detect_leader(pd.Series(m)),
-                        absent=detect_absent(pd.Series(m)),
-                    )
-                )
-            else:
-                out.append(
-                    Seat(
-                        table_no=t_idx,
-                        seat_no=s_idx + 1,
-                        name="(empty)",
-                        grade="",
-                        gender="",
-                        student_key="",
-                        leader=False,
-                        absent=False,
-                    )
-                )
-    return out
-
-
-def seats_to_dataframe(seats: List[Seat], day: str, tl_map: Dict[int, str]) -> pd.DataFrame:
+def seats_to_dataframe(seats: List[Seat], day: str) -> pd.DataFrame:
     rows = []
     for s in seats:
-        tl = ""
-        if s.student_key and tl_map.get(s.table_no, "") == s.student_key:
-            tl = "TL"
         rows.append(
             {
                 "Day": day,
@@ -568,7 +381,7 @@ def seats_to_dataframe(seats: List[Seat], day: str, tl_map: Dict[int, str]) -> p
                 "Name": s.name,
                 "Grade": s.grade,
                 "Gender": s.gender,
-                "Leader": tl,
+                "Leader": "TL" if s.leader else "",
                 "Absent": "Yes" if s.absent else "",
             }
         )
@@ -591,7 +404,7 @@ def style_table(df_out: pd.DataFrame):
     return df_out.style.apply(row_style, axis=1)
 
 
-def render_table_cards(seats: List[Seat], seats_per_table: int, tl_map: Dict[int, str]) -> None:
+def render_table_cards(seats: List[Seat], seats_per_table: int = 4) -> None:
     if not seats:
         st.info("No seating generated for this day.")
         return
@@ -613,9 +426,7 @@ def render_table_cards(seats: List[Seat], seats_per_table: int, tl_map: Dict[int
         for s in members:
             is_empty = s.name == "(empty)"
             cls = "seat"
-            # TL styling is driven by per-day TL selection, not file Role
-            is_tl = (not is_empty) and s.student_key and tl_map.get(tno, "") == s.student_key
-            if is_tl:
+            if s.leader:
                 cls += " leader"
             if s.absent:
                 cls += " absent"
@@ -630,15 +441,11 @@ def render_table_cards(seats: List[Seat], seats_per_table: int, tl_map: Dict[int
                 meta_bits.append(f"Gender: {s.gender}")
             meta = " · ".join(meta_bits) if meta_bits else ""
 
-            tags = []
-            if s.gender == "G" and not is_empty:
-                tags.append('<span class="tag girl">G</span>')
-            if s.gender == "B" and not is_empty:
-                tags.append('<span class="tag boy">B</span>')
-            if is_tl:
-                tags.append('<span class="tag leader">TL</span>')
+            tag_html = ""
+            if s.leader and not is_empty:
+                tag_html += '<span class="tag leader">TL</span>'
             if s.absent and not is_empty:
-                tags.append('<span class="tag absent">ABSENT</span>')
+                tag_html += '<span class="tag absent">ABSENT</span>'
 
             html.append(f'<div class="{cls}">')
             html.append(f'<div class="badge">{badge}</div>')
@@ -647,8 +454,8 @@ def render_table_cards(seats: List[Seat], seats_per_table: int, tl_map: Dict[int
             if meta:
                 html.append(f'<div class="meta">{meta}</div>')
             html.append("</div>")
-            if tags:
-                html.append(f'<div style="display:flex; gap:6px; align-items:flex-start;">{"".join(tags)}</div>')
+            if tag_html:
+                html.append(f'<div style="display:flex; gap:6px; align-items:flex-start;">{tag_html}</div>')
             html.append("</div>")
 
         html.append("</div>")
@@ -658,6 +465,285 @@ def render_table_cards(seats: List[Seat], seats_per_table: int, tl_map: Dict[int
     st.markdown("\n".join(html), unsafe_allow_html=True)
 
 
+def render_floorplan(seats: List[Seat], seats_per_table: int = 4, cols_per_row: int = 2) -> None:
+    """
+    Print-friendly "map" view. Tables are numbered (Table 1, Table 2, ...).
+    """
+    if not seats:
+        st.info("No seating generated for this day.")
+        return
+
+    # group seats by table number
+    tables: Dict[int, List[Seat]] = {}
+    for s in seats:
+        tables.setdefault(s.table_no, []).append(s)
+
+    # dynamic columns per row (default 2 like your sketch)
+    table_numbers = sorted(tables.keys())
+    for i in range(0, len(table_numbers), cols_per_row):
+        chunk = table_numbers[i : i + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for ci in range(cols_per_row):
+            with cols[ci]:
+                if ci >= len(chunk):
+                    st.empty()
+                    continue
+
+                tno = chunk[ci]
+                members = sorted(tables[tno], key=lambda x: x.seat_no)
+
+                lines = []
+                for m in members:
+                    if m.name == "(empty)":
+                        left = "(empty)"
+                        right = ""
+                    else:
+                        tl = "TL" if m.leader else ""
+                        g = m.gender if m.gender else ""
+                        right_bits = [b for b in [g, tl] if b]
+                        right = " · ".join(right_bits)
+                        left = m.name
+                    lines.append((left, right))
+
+                html = []
+                html.append('<div class="floor-box">')
+                html.append('<div class="floor-hdr">')
+                html.append(f'<div class="floor-title">Table {tno}</div>')
+                html.append(f'<div class="table-pill">{seats_per_table} seats</div>')
+                html.append("</div>")
+                html.append('<div class="floor-lines">')
+                for (left, right) in lines:
+                    html.append('<div class="floor-line">')
+                    html.append(f'<div class="left">• {left}</div>')
+                    html.append(f'<div class="right">{right}</div>')
+                    html.append("</div>")
+                html.append("</div></div>")
+                st.markdown("\n".join(html), unsafe_allow_html=True)
+
+
+# -------------------------
+# Session state
+# -------------------------
+def init_absence_state(days: List[str]) -> None:
+    if "absent_by_day" not in st.session_state:
+        st.session_state["absent_by_day"] = {d: set() for d in days}
+
+
+def set_absences_for_day(day: str, new_set: set) -> None:
+    st.session_state["absent_by_day"][day] = set(new_set)
+
+
+def get_absences_for_day(day: str) -> set:
+    return set(st.session_state["absent_by_day"].get(day, set()))
+
+
+def init_fixed_tables_state(days: List[str]) -> None:
+    if "fixed_tables_by_day" not in st.session_state:
+        st.session_state["fixed_tables_by_day"] = {d: {"enabled": False, "n_tables": 0} for d in days}
+
+
+def set_fixed_tables(day: str, enabled: bool, n_tables: int) -> None:
+    st.session_state["fixed_tables_by_day"][day] = {"enabled": bool(enabled), "n_tables": int(n_tables)}
+
+
+def get_fixed_tables(day: str) -> Tuple[bool, int]:
+    v = st.session_state["fixed_tables_by_day"].get(day, {"enabled": False, "n_tables": 0})
+    return bool(v.get("enabled", False)), int(v.get("n_tables", 0))
+
+
+def init_tl_state(days: List[str]) -> None:
+    # per day: dict of table_no -> student_key (or "")
+    if "tl_by_day" not in st.session_state:
+        st.session_state["tl_by_day"] = {d: {} for d in days}
+
+
+def set_tl_for_day(day: str, table_no: int, student_key: str) -> None:
+    st.session_state["tl_by_day"].setdefault(day, {})
+    st.session_state["tl_by_day"][day][int(table_no)] = student_key or ""
+
+
+def get_tl_for_day(day: str, table_no: int) -> str:
+    return st.session_state["tl_by_day"].get(day, {}).get(int(table_no), "")
+
+
+def ensure_one_tl_per_table(seats: List[Seat], day: str) -> List[Seat]:
+    """
+    Apply TL selections from session state onto generated seats.
+    Exactly one TL per table (or none) depending on user selection.
+    """
+    if not seats:
+        return seats
+
+    # clear all leaders first
+    seats2 = [Seat(**{**s.__dict__, "leader": False}) for s in seats]
+
+    # apply per-table selection
+    for s in seats2:
+        chosen = get_tl_for_day(day, s.table_no)
+        if chosen and s.student_key == chosen and s.name != "(empty)":
+            s.leader = True
+
+    return seats2
+
+
+def gender_balance_pass(
+    roster_list: List[dict],
+    n_tables: int,
+    seats_per_table: int,
+    max_same_grade_per_table: int,
+) -> List[List[dict]]:
+    """
+    Greedy seating that tries to avoid all-G/all-B tables by tracking gender counts per table.
+    Targets mixed tables where possible, but never blocks placement completely.
+    """
+    tables: List[List[dict]] = [[] for _ in range(n_tables)]
+    grade_counts: List[Dict[str, int]] = [dict() for _ in range(n_tables)]
+    gender_counts: List[Dict[str, int]] = [dict() for _ in range(n_tables)]  # {"G":x,"B":y,"":z}
+
+    def gnorm(x: str) -> str:
+        x = norm_key(x)
+        return "G" if x.startswith("g") else ("B" if x.startswith("b") else "")
+
+    for r in roster_list:
+        g = r.get("Grade", "")
+        sex = gnorm(r.get("Gender", ""))
+
+        # score tables: prefer tables with fewer people,
+        # prefer tables that would improve gender mix,
+        # prefer tables that keep grade constraint.
+        scored = []
+        for ti in range(n_tables):
+            if len(tables[ti]) >= seats_per_table:
+                continue
+
+            grade_ok = grade_counts[ti].get(g, 0) < max_same_grade_per_table
+            # current counts
+            gcount = gender_counts[ti].get("G", 0)
+            bcount = gender_counts[ti].get("B", 0)
+
+            # gender score: lower is better
+            # if table empty -> neutral
+            # if placing would create 3-0 or 4-0 -> worse
+            after_g = gcount + (1 if sex == "G" else 0)
+            after_b = bcount + (1 if sex == "B" else 0)
+
+            gender_penalty = 0
+            if sex in ["G", "B"]:
+                # penalize moving away from balance
+                gender_penalty += abs(after_g - after_b)
+                # extra penalty if would create mono table when already skewed
+                if (after_g == 0 and after_b >= 3) or (after_b == 0 and after_g >= 3):
+                    gender_penalty += 3
+
+            scored.append(
+                (
+                    0 if grade_ok else 100,               # hard-ish preference
+                    len(tables[ti]),                      # fill evenly
+                    gender_penalty,                       # balance
+                    grade_counts[ti].get(g, 0),           # prefer less same-grade
+                    ti,
+                )
+            )
+
+        if not scored:
+            continue
+
+        scored.sort()
+        chosen_ti = scored[0][-1]
+
+        tables[chosen_ti].append(r)
+        grade_counts[chosen_ti][g] = grade_counts[chosen_ti].get(g, 0) + 1
+        gender_counts[chosen_ti][sex] = gender_counts[chosen_ti].get(sex, 0) + 1
+
+    return tables
+
+
+def generate_plan_for_day(
+    df_day: pd.DataFrame,
+    day: str,
+    seats_per_table: int = 4,
+    max_same_grade_per_table: int = 2,
+    rotate_offset: int = 0,
+    fixed_tables: Optional[int] = None,
+) -> List[Seat]:
+    roster = df_day.copy()
+    roster = roster[roster["Name"].astype(str).str.strip().ne("")]
+    if roster.empty:
+        return []
+
+    roster = roster.sort_values(
+        ["Grade", "Name"],
+        key=lambda s: s.map(lambda v: grade_key(v)[0] if s.name == "Grade" else norm_text(v)),
+    )
+    roster_list = roster.to_dict(orient="records")
+
+    if roster_list:
+        rotate_offset = rotate_offset % len(roster_list)
+        roster_list = roster_list[rotate_offset:] + roster_list[:rotate_offset]
+
+    n_students = len(roster_list)
+    auto_tables = max(1, math.ceil(n_students / seats_per_table))
+    n_tables = int(fixed_tables) if fixed_tables and fixed_tables > 0 else auto_tables
+    n_tables = max(1, n_tables)
+
+    # grade frequency sort (more constrained first)
+    grades = [r.get("Grade", "") for r in roster_list]
+    freq: Dict[str, int] = {}
+    for g in grades:
+        freq[g] = freq.get(g, 0) + 1
+
+    roster_list.sort(
+        key=lambda r: (
+            -freq.get(r.get("Grade", ""), 0),
+            grade_key(r.get("Grade", ""))[0],
+            norm_text(r.get("Name", "")),
+        )
+    )
+
+    # gender + grade aware placement
+    tables = gender_balance_pass(
+        roster_list=roster_list,
+        n_tables=n_tables,
+        seats_per_table=seats_per_table,
+        max_same_grade_per_table=max_same_grade_per_table,
+    )
+
+    out: List[Seat] = []
+    for t_idx, members in enumerate(tables, start=1):
+        for s_idx in range(seats_per_table):
+            if s_idx < len(members):
+                m = members[s_idx]
+                out.append(
+                    Seat(
+                        table_no=t_idx,
+                        seat_no=s_idx + 1,
+                        name=norm_text(m.get("Name", "")),
+                        grade=norm_text(m.get("Grade", "")),
+                        gender=norm_text(m.get("Gender", "")),
+                        leader=False,  # applied later from TL selector
+                        absent=detect_absent(pd.Series(m)),
+                        student_key=norm_text(m.get("StudentKey", "")),
+                    )
+                )
+            else:
+                out.append(
+                    Seat(
+                        table_no=t_idx,
+                        seat_no=s_idx + 1,
+                        name="(empty)",
+                        grade="",
+                        gender="",
+                        leader=False,
+                        absent=False,
+                        student_key="",
+                    )
+                )
+
+    # apply TL selection (one TL per table)
+    out = ensure_one_tl_per_table(out, day=day)
+    return out
+
+
 # -------------------------
 # App
 # -------------------------
@@ -665,7 +751,11 @@ st.set_page_config(page_title="Seat Planner", page_icon="🪑", layout="wide")
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
 st.title("Seat Planner")
-st.caption("4 per table · Day-based rosters · Grade + Gender balancing · Absences + TL per day · Export")
+st.caption("4 per table · Day-based rosters · Grade + Gender balancing · Table layout print view · Export")
+
+# global toggle state for floorplan view
+if "show_floorplan" not in st.session_state:
+    st.session_state["show_floorplan"] = False
 
 with st.sidebar:
     st.header("Settings")
@@ -675,10 +765,8 @@ with st.sidebar:
 
     seats_per_table = st.number_input("Seats per table", min_value=2, max_value=10, value=4, step=1)
     max_same_grade = st.number_input("Max same grade per table", min_value=1, max_value=4, value=2, step=1)
-    prefer_gender = st.toggle("Prefer gender balance (G/B)", value=True)
 
     st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
-
     auto_correct = st.toggle("Auto-correct School/Class mismatches", value=True)
     strict_match = st.toggle("Strict match only (no correction)", value=False)
 
@@ -688,12 +776,20 @@ with st.sidebar:
 
 if show_print_mode:
     st.markdown(
-        "<style>.block-container{max-width: 1050px;} .table-card{background:white !important; color:black !important;} .seat{background:#f6f6f6 !important; color:black !important;} .seat .meta{color:#333 !important;} .kpi{background:#f6f6f6 !important; color:black !important;}</style>",
+        "<style>"
+        ".block-container{max-width: 1100px;}"
+        ".table-card{background:white !important; color:black !important;}"
+        ".seat{background:#f6f6f6 !important; color:black !important;}"
+        ".seat .meta{color:#333 !important;}"
+        ".kpi{background:#f6f6f6 !important; color:black !important;}"
+        ".floor-box{background:white !important; color:black !important; border:1px solid #ddd !important;}"
+        ".floor-line .right{color:#333 !important;}"
+        "</style>",
         unsafe_allow_html=True,
     )
 
 if not uploaded:
-    st.info("Upload a CSV/XLSX to begin. Required: School, Class, Name, Grade. Optional: Day, Gender(G/B), Role, Status.")
+    st.info("Upload a CSV/XLSX to begin. Required columns: School, Class, Name, Grade. Optional: Day, Gender (G/B), Status.")
     st.stop()
 
 try:
@@ -703,13 +799,10 @@ except Exception as e:
     st.stop()
 
 df = ensure_columns(df_raw)
-
-# stable key for session-only toggles
 df["StudentKey"] = df.apply(lambda r: make_student_key(r["School"], r["Class"], r["Name"], r["Grade"]), axis=1)
 
 schools, classes_by_school = build_school_class_options(df)
 
-# selectors
 colA, colB = st.columns([1, 1])
 with colA:
     selected_school = st.selectbox("School", schools, index=0 if schools else None)
@@ -717,7 +810,6 @@ with colB:
     class_opts = classes_by_school.get(selected_school, [])
     selected_class = st.selectbox("Class", class_opts, index=0 if class_opts else None)
 
-# mismatch handling
 df_school_vals = sorted({s for s in df["School"].map(norm_text) if s and s.lower() != "nan"})
 df_class_vals = sorted({c for c in df["Class"].map(norm_text) if c and c.lower() != "nan"})
 
@@ -773,7 +865,7 @@ total_students = filtered["Name"].astype(str).str.strip().ne("").sum()
 unique_students = filtered["Name"].astype(str).str.strip().nunique()
 grades_present = sorted({g for g in filtered["Grade"].astype(str) if g and g.lower() != "nan"})
 days_detected = sorted({d for d in filtered["Day"].astype(str) if d and d.lower() != "nan"})
-gender_present = sorted({g for g in filtered["Gender"].astype(str) if g in ["G", "B"]})
+gender_present = sorted({g for g in filtered["Gender"].astype(str) if g and g.lower() != "nan"})
 
 st.markdown(
     f"""
@@ -784,7 +876,11 @@ st.markdown(
   <div class="kpi"><div class="label">Students (rows)</div><div class="value">{total_students}</div></div>
   <div class="kpi"><div class="label">Unique names</div><div class="value">{unique_students}</div></div>
 </div>
-<p class="small-muted">Grades: {", ".join(grades_present) if grades_present else "n/a"} · Days: {", ".join(days_detected) if days_detected else "n/a"} · Gender: {", ".join(gender_present) if gender_present else "n/a"}</p>
+<p class="small-muted">
+Grades: {", ".join(grades_present) if grades_present else "n/a"}
+ · Gender: {", ".join(gender_present) if gender_present else "n/a"}
+ · Days in file: {", ".join(days_detected) if days_detected else "n/a"}
+</p>
 """,
     unsafe_allow_html=True,
 )
@@ -794,20 +890,20 @@ st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
 days = DEFAULT_DAYS
 day_map = split_by_day(filtered, days)
 
-# session states
+# session-only state init
 init_absence_state(days)
-init_table_count_state(days)
-init_leader_state(days)
+init_fixed_tables_state(days)
+init_tl_state(days)
 
 # -------------------------
-# Sidebar: Attendance + Tables per day
+# Sidebar: Attendance (session-only) + fixed tables per day
 # -------------------------
 with st.sidebar:
     st.subheader("Attendance (session-only)")
     st.caption("Tick absent kids for a day. This only lasts for this browser session.")
 
-    attendance_day = st.selectbox("Mark absences for day", days, index=0)
-    absent_search = st.text_input("Search student", value="", placeholder="Type a name…")
+    attendance_day = st.selectbox("Mark absences for day", days, index=0, key="att_day")
+    absent_search = st.text_input("Search student", value="", placeholder="Type a name…", key="att_search")
 
     df_att = day_map.get(attendance_day, pd.DataFrame(columns=filtered.columns)).copy()
     if not df_att.empty:
@@ -833,7 +929,7 @@ with st.sidebar:
             ui_df,
             hide_index=True,
             use_container_width=True,
-            height=300,
+            height=320,
             column_config={
                 "Absent": st.column_config.CheckboxColumn("Absent", help="Tick if absent today"),
                 "Name": st.column_config.TextColumn("Name"),
@@ -844,7 +940,6 @@ with st.sidebar:
             disabled=["StudentKey"],
             key=f"att_editor_{effective_school}_{effective_class}_{attendance_day}",
         )
-
         new_abs = set(edited.loc[edited["Absent"] == True, "StudentKey"].tolist())
         set_absences_for_day(attendance_day, new_abs)
 
@@ -861,23 +956,28 @@ with st.sidebar:
     st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
 
     st.subheader("Tables per day")
-    st.caption("Set a fixed number of tables for a specific day, or leave on Auto.")
+    st.caption("Set the number of tables for a specific day, or leave on Auto.")
+    table_day = st.selectbox("Choose day for tables", days, index=0, key="tbl_day")
 
-    tables_day = st.selectbox("Choose day for tables", days, index=0, key="tables_day_pick")
-    fixed = st.toggle("Set fixed tables for this day", value=bool(st.session_state["tables_fixed_by_day"].get(tables_day, False)))
-    st.session_state["tables_fixed_by_day"][tables_day] = bool(fixed)
+    enabled, n_tables = get_fixed_tables(table_day)
+    enabled = st.toggle("Set fixed tables for this day", value=enabled, key=f"fixed_enable_{table_day}")
+    n_tables = st.number_input("Number of tables", min_value=1, max_value=50, value=max(1, n_tables) if enabled else 6, step=1, key=f"fixed_num_{table_day}")
 
-    if fixed:
-        n = st.number_input("Number of tables", min_value=1, max_value=30, value=max(1, int(st.session_state["tables_count_by_day"].get(tables_day, 6) or 6)), step=1)
-        st.session_state["tables_count_by_day"][tables_day] = int(n)
-    else:
-        st.session_state["tables_count_by_day"][tables_day] = 0
+    set_fixed_tables(table_day, enabled, n_tables)
 
 st.markdown('<hr class="hr-soft">', unsafe_allow_html=True)
 
-# -------------------------
-# Main Tabs
-# -------------------------
+# Top controls: layout toggle (button)
+b1, b2, b3 = st.columns([1, 1.2, 5])
+with b1:
+    if st.button("🗺️ Table layout"):
+        st.session_state["show_floorplan"] = True
+with b2:
+    if st.button("🪑 Card view"):
+        st.session_state["show_floorplan"] = False
+with b3:
+    st.caption("Table layout is a print-friendly numbered grid of tables with names. Card view is the detailed seating chart.")
+
 tabs = st.tabs(days)
 all_exports = []
 
@@ -885,85 +985,79 @@ for i, day in enumerate(days):
     with tabs[i]:
         df_day = day_map.get(day, pd.DataFrame(columns=filtered.columns)).copy()
 
-        # apply session-only absences: remove from generation
+        # apply absences: remove absent from generation
         if not df_day.empty:
             abs_set = get_absences_for_day(day)
             if abs_set:
                 df_day = df_day[~df_day["StudentKey"].isin(abs_set)].copy()
 
-        rotate_offset = i
+        # fixed tables for this day
+        fixed_enabled, fixed_n = get_fixed_tables(day)
+        fixed_tables = fixed_n if fixed_enabled else None
 
-        fixed_tables = None
-        if st.session_state["tables_fixed_by_day"].get(day, False):
-            fixed_tables = int(st.session_state["tables_count_by_day"].get(day, 0) or 0)
-
+        # generate seats (gender+grade balancing)
         seats = generate_plan_for_day(
             df_day=df_day,
+            day=day,
             seats_per_table=int(seats_per_table),
             max_same_grade_per_table=int(max_same_grade),
-            rotate_offset=rotate_offset,
-            fixed_tables=fixed_tables if (fixed_tables and fixed_tables > 0) else None,
-            prefer_gender_balance=bool(prefer_gender),
+            rotate_offset=i,
+            fixed_tables=fixed_tables,
         )
 
-        # build table -> seats map for TL picker UI
-        by_table: Dict[int, List[Seat]] = {}
-        for s in seats:
-            by_table.setdefault(s.table_no, []).append(s)
+        # TL selector UI (per day, one TL per table)
+        # Build options from seats in this day (NOT from the file), so it always matches what's seated.
+        if seats:
+            st.markdown('<div class="note">Pick one TL per table for this day. This updates the seating chart + export instantly.</div>', unsafe_allow_html=True)
+            n_tables_in_day = max(s.table_no for s in seats)
+            # use 2 columns to reduce vertical space
+            tl_cols = st.columns(2)
+            for tno in range(1, n_tables_in_day + 1):
+                # candidates are the seated students in this table (non-empty)
+                candidates = [s for s in seats if s.table_no == tno and s.name != "(empty)"]
+                # display options
+                opts = ["— none —"] + [f"{c.name} (Seat {c.seat_no})" for c in candidates]
+                key_map = {f"{c.name} (Seat {c.seat_no})": c.student_key for c in candidates}
 
-        # RIGHT PANEL: TL pickers (one per table) - THIS IS WHERE YOUR "none" BUG WAS
-        left, mid, right = st.columns([1.25, 0.95, 1.15])
+                current_key = get_tl_for_day(day, tno)
+                current_label = "— none —"
+                for label, sk in key_map.items():
+                    if sk == current_key:
+                        current_label = label
+                        break
+
+                with tl_cols[(tno - 1) % 2]:
+                    chosen = st.selectbox(f"Table {tno}", opts, index=opts.index(current_label), key=f"tl_{day}_{tno}")
+                    set_tl_for_day(day, tno, "" if chosen == "— none —" else key_map.get(chosen, ""))
+
+            # re-apply TL selection after UI changes
+            seats = ensure_one_tl_per_table(seats, day=day)
+
+        left, right = st.columns([1.25, 1])
 
         with left:
-            st.subheader("Seating chart")
-            tl_map = st.session_state.get("tl_by_day_table", {}).get(day, {})
-            render_table_cards(seats, seats_per_table=int(seats_per_table), tl_map=tl_map)
-
-        with mid:
-            st.subheader("Team leaders")
-            st.caption("Pick one TL per table for this day. This updates the seating chart + export instantly.")
-
-            # ensure tl_map exists
-            st.session_state["tl_by_day_table"].setdefault(day, {})
-            tl_map = st.session_state["tl_by_day_table"][day]
-
-            for tno in sorted(by_table.keys()):
-                # build key->label mapping + key list (fix for '— none —' everywhere)
-                key_to_label = {"": "— none —"}
-                keys = [""]
-
-                for s in sorted(by_table[tno], key=lambda x: x.seat_no):
-                    if s.name != "(empty)" and s.student_key:
-                        k = s.student_key
-                        label = f"{s.name} (Grade {s.grade}{', '+s.gender if s.gender else ''})"
-                        key_to_label[k] = label
-                        keys.append(k)
-
-                current = get_tl(day, tno).strip()
-                idx = keys.index(current) if current in keys else 0
-
-                chosen_key = st.selectbox(
-                    f"Table {tno}",
-                    options=keys,
-                    index=idx,
-                    format_func=lambda k: key_to_label.get(k, "— none —"),
-                    key=f"tl_pick_{day}_{tno}",
-                )
-                set_tl(day, tno, chosen_key)
+            if st.session_state["show_floorplan"]:
+                st.subheader("Table layout (numbered, print-friendly)")
+                render_floorplan(seats, seats_per_table=int(seats_per_table), cols_per_row=2)
+            else:
+                st.subheader("Seating chart")
+                render_table_cards(seats, seats_per_table=int(seats_per_table))
 
         with right:
             st.subheader("Table view")
-            tl_map = st.session_state.get("tl_by_day_table", {}).get(day, {})
-            df_out = seats_to_dataframe(seats, day=day, tl_map=tl_map)
+            df_out = seats_to_dataframe(seats, day=day)
 
             try:
-                st.dataframe(style_table(df_out), use_container_width=True, height=520)
+                st.dataframe(style_table(df_out), use_container_width=True, height=440)
             except Exception:
-                st.dataframe(df_out, use_container_width=True, height=520)
+                st.dataframe(df_out, use_container_width=True, height=440)
 
             all_exports.append(df_out)
 
-            st.caption("Gender expects G/B. TL is selected per-day in the middle panel. Absences come from the sidebar checklist (session-only).")
+            st.caption(
+                "Absence for generation is controlled by the sidebar checklist (session-only). "
+                "Gender balancing prefers mixed tables (G/B) when possible. TL is selected per-table per-day."
+            )
 
 # export
 export_df = pd.concat(all_exports, ignore_index=True) if all_exports else pd.DataFrame()
@@ -994,4 +1088,4 @@ else:
         )
 
 with st.expander("Preview uploaded data"):
-    st.dataframe(filtered.head(80), use_container_width=True)
+    st.dataframe(filtered.head(50), use_container_width=True)
